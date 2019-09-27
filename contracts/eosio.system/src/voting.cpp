@@ -2,6 +2,7 @@
 #include <eosio/datastream.hpp>
 #include <eosio/eosio.hpp>
 #include <eosio/multi_index.hpp>
+#include <eosio/permission.hpp>
 #include <eosio/privileged.hpp>
 #include <eosio/serialize.hpp>
 #include <eosio/singleton.hpp>
@@ -9,6 +10,9 @@
 #include <eosio.system/eosio.system.hpp>
 #include <eosio.token/eosio.token.hpp>
 
+#include <type_traits>
+#include <limits>
+#include <set>
 #include <algorithm>
 #include <cmath>
 
@@ -20,17 +24,27 @@ namespace eosiosystem {
    using eosio::microseconds;
    using eosio::singleton;
 
-   void system_contract::regproducer( const name& producer, const eosio::public_key& producer_key, const std::string& url, uint16_t location ) {
-      check( url.size() < 512, "url too long" );
-      check( producer_key != eosio::public_key(), "public key should not be the default value" );
-      require_auth( producer );
+   eosio::block_signing_authority convert_to_block_signing_authority( const eosio::public_key& producer_key ) {
+      return eosio::block_signing_authority_v0{ .threshold = 1, .keys = {{producer_key, 1}} };
+   }
 
+   template<class... Ts> struct overloaded : Ts... { using Ts::operator()...; };
+   template<class... Ts> overloaded(Ts...) -> overloaded<Ts...>;
+
+   bool is_null_key( const eosio::public_key& pub_key ) {
+      return std::visit( overloaded{
+         []( const eosio::ecc_public_key& k ) { return (k == eosio::ecc_public_key{}); },
+         []( const eosio::webauthn_public_key& k ) { return (k.key == eosio::ecc_public_key{}); }
+      }, pub_key );
+   }
+
+   void system_contract::register_producer( const name& producer, const eosio::block_signing_authority& producer_authority, const std::string& url, uint16_t location ) {
       auto prod = _producers.find( producer.value );
       const auto ct = current_time_point();
 
       if ( prod != _producers.end() ) {
          _producers.modify( prod, producer, [&]( producer_info& info ){
-            info.producer_key = producer_key;
+            info.producer_key = {};
             info.is_active    = true;
             info.url          = url;
             info.location     = location;
@@ -47,11 +61,22 @@ namespace eosiosystem {
             update_total_votepay_share( ct, 0.0, prod->total_votes );
             // When introducing the producer2 table row for the first time, the producer's votes must also be accounted for in the global total_producer_votepay_share at the same time.
          }
+
+         auto prod3 = _producers3.find( producer.value );
+         if( prod3 == _producers3.end() ) {
+            _producers3.emplace( producer, [&]( producer_info3& info ){
+               info.owner              = producer;
+               info.producer_authority = producer_authority;
+            });
+         } else {
+            _producers3.modify( prod3, producer, [&]( producer_info3& info ){
+               info.producer_authority = producer_authority;
+            });
+         }
       } else {
          _producers.emplace( producer, [&]( producer_info& info ){
             info.owner           = producer;
             info.total_votes     = 0;
-            info.producer_key    = producer_key;
             info.is_active       = true;
             info.url             = url;
             info.location        = location;
@@ -61,8 +86,53 @@ namespace eosiosystem {
             info.owner                     = producer;
             info.last_votepay_share_update = ct;
          });
+         _producers3.emplace( producer, [&]( producer_info3& info ){
+            info.owner              = producer;
+            info.producer_authority = producer_authority;
+         });
       }
 
+   }
+
+   void system_contract::regproducer( const name& producer, const eosio::public_key& producer_key, const std::string& url, uint16_t location ) {
+      require_auth( producer );
+      check( url.size() < 512, "url too long" );
+
+      check( producer_key.index() < 2, "currently only K1 and R1 producer keys are supported" );
+      check( !is_null_key( producer_key ), "public key should not be the default value" );
+      check_permission_authorization( null_account, active_permission, {} ); // aborts transaction if native side cannot unpack producer_key
+
+      register_producer( producer, convert_to_block_signing_authority( producer_key ), url, location );
+   }
+
+   void system_contract::regproducer2( const name& producer, const eosio::block_signing_authority& producer_authority, const std::string& url, uint16_t location ) {
+      require_auth( producer );
+      check( url.size() < 512, "url too long" );
+
+
+      std::visit( [&](auto&& auth ) {
+         uint32_t sum_weights = 0;
+         std::set<eosio::public_key> unique_keys;
+
+         for (const auto& kw: auth.keys ) {
+            check( kw.key.index() < 2, "currently only K1 and R1 producer keys are supported" );
+            check( !is_null_key( kw.key ), "producer authority includes an invalid key" );
+
+            if( std::numeric_limits<uint32_t>::max() - sum_weights <= kw.weight ) {
+               sum_weights = std::numeric_limits<uint32_t>::max();
+            } else {
+               sum_weights += kw.weight;
+            }
+
+            unique_keys.insert(kw.key);
+         }
+
+         check( auth.keys.size() == unique_keys.size(), "producer authority includes a duplicated key" );
+         check( sum_weights >= auth.threshold, "producer authority is unsatisfiable" );
+      }, producer_authority );
+
+
+      register_producer( producer, producer_authority, url, location );
    }
 
    void system_contract::unregprod( const name& producer ) {
